@@ -6,7 +6,10 @@ account's sessions, background tasks and Applications inside it.
 
 > **Status:** design. Nothing here runs yet. The interface it implements is
 > specified in Octopus under
-> [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/main/docs/plans/runtime-providers.md).
+> [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/main/docs/plans/runtime-providers.md);
+> how this repository implements it is [`docs/design.md`](docs/design.md) —
+> Kata Containers on bare metal, one lightweight VM per account, a control plane
+> and an admin console.
 
 ## Why this exists
 
@@ -37,8 +40,22 @@ turns out to be concentrated rather than spread:
   because Application backends are reverse-proxied and "ask the OS for a free
   port" stops being true the moment the server and the child are not the same
   machine.
+- **`callback_base`** — the other direction: the address work *inside* the
+  runtime uses to reach the server back. Every MCP tool call a CLI makes, and
+  every Application backend that talks to an agent, goes there — and on a
+  separate machine `127.0.0.1` is the runtime itself, not Octopus.
 - **`confine`** — the working-directory boundary, which in a per-tenant runtime
   is structural rather than a check: the machine only has that tenant's disk.
+- **`ensure` / `release`** — start the account's machine before any work and
+  put it away when nothing is left running. Octopus decides when, from facts it
+  already has; the provider makes it fast.
+
+One rule runs through all of it: **an execution's environment is exactly what
+Octopus passes in.** A provider adds nothing from the server's own
+environment — on a shared host that environment is the operator's keys.
+
+The conformance suite in Octopus is the contract. A provider conforms when it
+passes it, not when it matches this README.
 
 Deliberately **not** in the first version: file primitives. Under a local
 provider they are overhead; under a remote one, every caller that reaches for
@@ -50,8 +67,9 @@ provider they are overhead; under a remote one, every caller that reaches for
   any of this.
 - **A general sandbox platform.** The target is Octopus's protocol, not an
   arbitrary workload API.
-- **Deployment.** Host inventory, identity, network policy and egress belong to
-  whoever runs it, not here.
+- **Kubernetes, at first.** containerd + Kata + our own control plane on a
+  handful of bare-metal nodes; a cluster scheduler only when placement across
+  many nodes becomes the hard problem (`docs/design.md` §2).
 
 ## License
 

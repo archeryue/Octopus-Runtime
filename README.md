@@ -1,15 +1,18 @@
 # Octopus-Runtime
 
-A **Runtime provider** for [Octopus](https://github.com/archeryue/Octopus): it
-gives each account a durable machine of its own, and Octopus runs that
-account's sessions, background tasks and Applications inside it.
+An independent platform that runs **one isolated machine per tenant** on bare
+metal — its own controller, admin console and release cadence — and implements
+[Octopus](https://github.com/archeryue/Octopus)'s **Runtime standard**, so
+Octopus can run each account's sessions, background tasks and Applications on
+a machine of that account's own. Octopus defines the standard and runs fully
+without this; this platform follows the standard.
 
 > **Status:** design. Nothing here runs yet. The interface it implements is
 > specified in Octopus under
 > [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/main/docs/plans/runtime-providers.md);
 > how this repository implements it is [`docs/design.md`](docs/design.md) —
-> Kata Containers on bare metal, one lightweight VM per account, a control plane
-> and an admin console.
+> k3s with Kata Containers on a bare-metal box, one lightweight VM per account,
+> an owner's own machine joinable as a node, a controller and an admin console.
 
 ## Why this exists
 
@@ -65,11 +68,9 @@ provider they are overhead; under a remote one, every caller that reaches for
 
 - **Replacing `LocalRuntime`.** Running Octopus on a laptop must never require
   any of this.
-- **A general sandbox platform.** The target is Octopus's protocol, not an
-  arbitrary workload API.
-- **Kubernetes, at first.** containerd + Kata + our own control plane on a
-  handful of bare-metal nodes; a cluster scheduler only when placement across
-  many nodes becomes the hard problem (`docs/design.md` §2).
+- **Steering Octopus.** Octopus defines the Runtime standard and is developed
+  without regard to this repository; this platform follows the standard's
+  versions and proves conformance with Octopus's own suite.
 
 ## License
 

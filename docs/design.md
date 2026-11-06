@@ -226,6 +226,91 @@ Start time is on a user's path only after a host reboot or an image rollout,
 never in normal operation (§8). The measure that matters is **time from host
 reboot until every tenant answers**.
 
+### 2.5 Performance: configuring KubeVirt for near-native
+
+A tenant's machine must be **as fast as possible** — CPU, disk and network —
+because the v1 priority is experience parity (§3.1) and its main work is
+building software.
+
+**Why the pod around the VM costs almost nothing.** A KubeVirt VM is a QEMU
+process inside an ordinary pod. A container is not a virtualization layer: it
+is namespaces and cgroups around a normal process on the host kernel. So the
+pod is not on the hot path:
+
+- the guest's CPU instructions run on the real CPU through KVM;
+- its memory is ordinary host memory;
+- inside, the guest OS sees an ordinary VM, with every capability.
+
+What the pod *does* touch is the host-side plumbing and accounting: the
+network path, how the disk is attached, and the cgroup limits. That is where
+performance is won or lost, and every setting below is a deliberate choice.
+Field names follow KubeVirt's API and are checked against the version
+installed.
+
+**CPU**
+
+| Setting | Choice | Why |
+|---|---|---|
+| CPU model | `host-passthrough` | The guest sees the host CPU's full feature set (AVX and the rest) — no lowest-common-denominator model. Live migration then needs nodes with the same CPU, which v1 does not do anyway |
+| CPU limits | **No hard CPU limit.** A CPU request sizes scheduling | A hard limit makes the kernel's CFS throttle the VM when its quota runs out mid-build, causing latency spikes. Agents mostly wait on a model, so vCPUs share well |
+| Dedicated CPUs | Off by default; an option for a premium tier (`dedicatedCpuPlacement`, Guaranteed QoS) | Pinning gives the most stable latency, but caps tenants at physical cores / vCPUs per tenant. Measured in the bake-off before being offered |
+| NUMA | One socket per host (§12) | On a dual-socket machine, a VM whose vCPUs and memory sit on different sockets pays for every remote access. If a dual-socket host is used, KubeVirt's NUMA-aware placement keeps each VM on one socket |
+| Host | CPU governor `performance`; deep C-states limited | Removes frequency ramp-up latency on interactive work |
+
+**Memory**
+
+| Setting | Choice | Why |
+|---|---|---|
+| Guest memory | Request = limit, sized per tier; no swap, no overcommit (§8) | The VM's memory is always there; no eviction under pressure |
+| QEMU overhead | KubeVirt's computed overhead **plus a margin** above the guest's memory | The pod's memory limit covers the whole QEMU process, not only the guest. Too tight a limit lets the host's OOM killer **kill the whole VM** — the one real risk the pod adds |
+| Huge pages | Measured in the bake-off (2 MiB pages, reserved on the host) | Fewer TLB misses for memory-heavy builds; costs flexibility, since reserved huge pages are not available to anything else |
+| Host | Transparent huge pages on | A cheap gain for the QEMU processes |
+
+**Disk**
+
+| Setting | Choice | Why |
+|---|---|---|
+| Volume mode | **Block** (`volumeMode: Block`) on local NVMe through TopoLVM | The volume reaches QEMU as a raw block device. **Not** filesystem mode, which puts the VM's disk image as a file on the host's filesystem — an extra layer |
+| Thin vs. thick LVM | Thin (snapshots need it), with its overhead measured; thick for a tier that wants the last few percent | Thin provisioning adds metadata work on first writes; snapshots are the price of "restore my computer" |
+| Bus | `virtio` (`virtio-blk`) | Paravirtual; no emulated SATA or SCSI controller |
+| Cache and I/O | `cache: none` with native AIO (`io: native`) | O_DIRECT: no double caching in the host's page cache, and writes are on the device when the guest is told they are. This is the fast *and* safe pair for block devices |
+| I/O threads | A dedicated I/O thread per disk (`dedicatedIOThread`) | Disk I/O does not contend with QEMU's main loop |
+| Queues | Multi-queue block (`blockMultiQueue`), one queue per vCPU | Parallel I/O from parallel build jobs |
+| Guest filesystem | ext4 (or xfs), with discard / periodic `fstrim` | Freed blocks return to the thin pool |
+| Never | `virtio-fs`, or disk images on network storage, for a tenant's root | The slow paths for small-file work (`node_modules`, `git`) |
+
+**Network**
+
+| Setting | Choice | Why |
+|---|---|---|
+| Binding | `masquerade` on the pod network | KubeVirt's recommended binding for the pod network: works with NetworkPolicy and future migration. Bridge binding on the pod network has caveats; a secondary network (Multus bridge or SR-IOV) is the route if a tier ever needs line rate |
+| Acceleration | `vhost-net` in use (requires `/dev/vhost-net` on the node, checked at node setup) | Packet processing in the host kernel instead of in QEMU's userspace |
+| Queues | `networkInterfaceMultiqueue` | Parallel network queues, one per vCPU |
+| MTU | Set end to end for the overlay in use: none within one node; WireGuard's lower MTU across nodes | Avoids fragmentation, which silently halves throughput |
+| Data path | The Octopus site reaches each tenant's agent over the pod network on the same node | No hop through the k3s API server (§3) |
+
+**The guest**
+
+- **Direct kernel boot**, a minimal image, no cloud-init: seconds to boot (§2.4).
+- `virtio` drivers throughout.
+- `qemu-guest-agent`, for health checks and for freezing the filesystem during a
+  snapshot.
+- `kvm-clock` for time.
+- Only the services the machine needs.
+
+**Verified, not assumed.** The bake-off (§3.2) measures every one of these
+against the host itself, not only against `LocalRuntime`:
+
+- disk: `fio` random and sequential, IOPS and latency, inside the VM vs. on the
+  host NVMe;
+- network: `iperf3` and request latency to the model APIs;
+- the application benchmarks.
+
+Each knob above that is marked "measured" is an explicit row in the bake-off
+matrix. Targets are set before the run, not after: disk within a few percent of
+the host device, network within a few percent of the host, builds within the
+§3.1 margin.
+
 ## 3. v1: experience first, then topology
 
 ### 3.1 The v1 priority is experience parity
@@ -262,7 +347,10 @@ against `LocalRuntime`, before the decision is final.
 - **gVisor**, as the lightweight baseline.
 - Optionally **Virtink** (Cloud Hypervisor).
 
-**Measures**, beyond the gate of §3.1:
+**Measures**, beyond the gate of §3.1, with the configuration of §2.5 and its
+"measured" knobs as rows of the matrix:
+
+- `fio` and `iperf3` inside the VM against the bare host;
 
 - a large `git clone` and a full build of Octopus, with cold and warm caches;
 - idle memory per tenant;
@@ -529,7 +617,9 @@ Plus two more:
 
 No GPU; modest CPU; memory is what runs out first.
 
-- **CPU:** 8–16 cores with VT-x or AMD-V enabled in the BIOS.
+- **CPU:** 8–16 cores with VT-x or AMD-V enabled in the BIOS, **on a single
+  socket**. A dual-socket machine adds NUMA effects that need explicit placement
+  (§2.5); a single socket avoids them.
 - **Memory:** 128 GB preferred — v1 holds every tenant's memory with no
   overcommit (§8), so memory sets capacity. Used workstations take cheap DDR4
   ECC.

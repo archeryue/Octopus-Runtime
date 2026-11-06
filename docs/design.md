@@ -458,6 +458,25 @@ passes takes its place, best reliability first, ties to the simplest to operate.
    `codex`, Node, Python, `git` and common build tools: a VM disk image for
    KubeVirt, an OCI image for Kata or gVisor.
 
+**Languages: Go is this repository's main language.**
+
+- **Go:** the in-machine agent, the controller and the admin console's backend.
+  - The agent is one static binary in every tenant image.
+  - The controller talks to the Kubernetes API through `client-go` /
+    `controller-runtime`, and to KubeVirt through its Go client. Kubernetes
+    tooling is native in Go.
+- **The admin console's frontend** is a web app.
+- **The provider is the one exception, and a temporary one.** Octopus loads a
+  provider as a Python class in its own process, because its Runtime standard
+  is a Python interface today. Until that changes, `KubeRuntime` is a thin
+  Python package: a client of the controller and the agent, with no logic of
+  its own.
+  - When Octopus turns the standard into a wire protocol (Octopus's roadmap,
+    item 2), Octopus ships a generic remote-Runtime client in its own
+    repository.
+  - This repository then only implements the protocol's server side, in Go,
+    and contains no Python.
+
 **Control path and data path are separate.** `ensure`, `release` and `expose`
 go through the controller. An `exec` asks the controller once where the
 tenant's agent is (its cluster IP + a short-lived credential) and then streams

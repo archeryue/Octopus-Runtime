@@ -13,7 +13,7 @@ without this; this platform follows the standard.
 > how this repository implements it is [`docs/design.md`](docs/design.md) —
 > k3s on bare metal, one always-on cloud computer per account — a full VM
 > through KubeVirt by default, confirmed by a bake-off against today's
-> experience — a controller and an admin console.
+> experience — a controller and an admin console, written mainly in Go.
 
 ## Why this exists
 

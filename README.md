@@ -11,8 +11,9 @@ without this; this platform follows the standard.
 > specified in Octopus under
 > [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/runtime-provider/docs/plans/runtime-providers.md);
 > how this repository implements it is [`docs/design.md`](docs/design.md) —
-> k3s with Kata Containers on bare metal, one always-on lightweight VM per
-> account, a controller and an admin console.
+> k3s on bare metal, one always-on machine per account — KubeVirt, Kata or
+> gVisor, chosen by a bake-off against today's experience — a controller and
+> an admin console.
 
 ## Why this exists
 

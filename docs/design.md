@@ -351,7 +351,6 @@ against `LocalRuntime`, before the decision is final.
 "measured" knobs as rows of the matrix:
 
 - `fio` and `iperf3` inside the VM against the bare host;
-
 - a large `git clone` and a full build of Octopus, with cold and warm caches;
 - idle memory per tenant;
 - **time from host reboot until every tenant answers**, and one machine's

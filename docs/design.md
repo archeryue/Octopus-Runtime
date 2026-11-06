@@ -203,6 +203,44 @@ things to get right:
 - **Every node that runs VMs needs `/dev/kvm`.** It is native on bare metal and
   nested on WSL2 (§3.3).
 
+**VM-management platforms without Kubernetes — considered, not chosen.**
+The core need is a fleet of long-lived VMs, so platforms built for exactly that
+were weighed against k3s + KubeVirt. Both use the same QEMU/KVM underneath.
+
+| Platform | Its strengths | Why not the default |
+|---|---|---|
+| **Incus** (the community fork of LXD) | API-first, a good fit for a controller-driven platform. **Projects** give per-tenant quotas, a natural tenant boundary. Storage pools (ZFS, LVM, btrfs, Ceph) with native snapshots, copy and migration; network ACLs; clustering. Light: runs on a stock Ubuntu. Fewer layers: a VM's NIC sits on a host bridge | No decisive advantage, below |
+| **Proxmox VE** | The most mature and lowest-effort operations for a VM fleet: a web UI, clustering, HA, firewall, SDN. **Proxmox Backup Server**: incremental, deduplicated, verifiable backups. Every QEMU performance option exposed; a full REST API | A whole-machine OS geared to operating through its UI; no decisive advantage, below |
+
+**Why k3s + KubeVirt stays the default:**
+
+- **No decisive advantage on performance.** CPU and memory are identical:
+  KVM in all three.
+  - Disk is equal with KubeVirt's block-mode volumes and `cache: none` (§2.5).
+  - Network differs only by the pod network's masquerade hop; with `vhost-net`
+    and multi-queue that is a few percent, invisible for this workload (model
+    API calls, `git`, package installs).
+- **No decisive advantage on reliability.** Incus and Proxmox have fewer
+  layers, and so fewer failure points. KubeVirt has more components but long,
+  large-scale production use as OpenShift Virtualization, and running VMs
+  survive its management plane failing (§2.3).
+- **What k3s gives that they do not:**
+  - **Containers in the same cluster**, with the full Kubernetes ecosystem —
+    deployments, services, ingress, Helm. The likely uses are Octopus
+    Application backends running in containers, and the site, the controller
+    and monitoring deployed as containers. Incus can run containers too
+    (system containers, and OCI application containers in recent versions), but
+    the ecosystem is far smaller.
+  - **Alignment with enterprises** for Kraken's private deployments: many run
+    Kubernetes or OpenShift, whose virtualization is KubeVirt.
+  - **Transferable knowledge**: Kubernetes skills and material are everywhere,
+    which matters for learning, hiring and extending the platform later.
+
+A platform used less widely costs learning now and risks incompatibility with
+later needs. Without a decisive advantage to pay for that, the default stays.
+If operating VMs on k3s proves the expensive part, Proxmox and Harvester are
+the fallbacks to revisit.
+
 **Harvester** (SUSE) — Kubernetes (RKE2) + KubeVirt + Longhorn + a VM web UI,
 on its own OS — is the same stack already assembled. It is a reference design
 and a fallback if operating VMs ourselves proves the expensive part, but it is

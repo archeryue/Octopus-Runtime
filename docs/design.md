@@ -44,8 +44,9 @@ The dependency runs one way:
 
 ## 2. Technology choice
 
-**k3s for orchestration, on bare metal. The isolation technology — KubeVirt,
-Kata Containers or gVisor — is chosen by a bake-off (§3), not on paper.**
+**k3s for orchestration, on bare metal. The default isolation technology is
+KubeVirt — a full VM per account. It is a default, not a final decision: the
+bake-off (§3.2) validates it, with Kata Containers as the fallback.**
 
 ### 2.1 k3s
 
@@ -66,39 +67,164 @@ what it is given.
 v1 starts with one or two nodes (§3). Plain libvirt would do for one node
 forever; k3s is chosen because the cluster is expected to grow.
 
-### 2.2 The isolation technology: three candidates
+### 2.2 What a tenant's machine is: a cloud computer
 
-Most agent-sandbox technology is optimized for **creating short-lived sandboxes
-fast**: Firecracker, libkrun, warm pools, snapshots. Octopus-Runtime v1 wants the
-opposite: **a few long-lived, always-on machines** with persistent disks, full
-compatibility (builds, `npm`, `git`, perhaps Docker), good disk I/O and
-stability. Boot time barely matters, because a tenant's machine does not stop
-(§8). Three candidates fit that shape well enough to measure:
+A tenant's Runtime is **not a sandbox** where an agent runs a few commands and
+leaves. It is the user's **cloud computer**:
 
-| Candidate | What a tenant gets | Expectation |
-|---|---|---|
-| **KubeVirt** | A full VM — e.g. Ubuntu with systemd — whose disk is a block device on a persistent volume, managed as a Kubernetes `VirtualMachine` | Closest to today's environment, which is an Ubuntu box. Most compatible and stable; heavier per tenant, more to operate |
-| **Kata Containers** (Cloud Hypervisor) | A pod running inside its own small VM, through a `RuntimeClass` | A real VM boundary with a container's workflow. The guest is a minimal kernel plus a container, not a full OS; the volume's way in (block vs. `virtio-fs`) decides its I/O |
-| **gVisor** | A pod whose system calls go to a user-space kernel | The lightweight baseline. Not a VM; some system calls differ, and I/O-heavy work is slower |
+- always on;
+- where their agents build software (file-heavy work: `npm install`, `git`,
+  compilers, test suites);
+- where they install tools and run services;
+- expected to be exactly as they left it tomorrow.
 
-Considered and not candidates for v1:
+Five requirements follow, and every option below is judged against them:
 
-- **Firecracker** — its strength, fast boots and snapshots, does not matter for
-  always-on machines; no shared filesystem, and its own orchestration to build.
-- **libkrun** — young, aimed at local and ephemeral sandboxes.
-- **Plain containers (`runc`)** — not a boundary between tenants.
-- **Hosted services** (E2B, Daytona, Modal, Northflank) — priced per second
-  for short sandboxes, and not self-hosted.
+| # | Requirement |
+|---|---|
+| R1 | **Long-lived and always on**: months of uptime, not minutes |
+| R2 | **The whole machine persists**: what the user or their agent installs and configures survives a restart, not only a data volume |
+| R3 | **Full compatibility**: a real OS with systemd, so services, Docker and any tool run as on an ordinary server |
+| R4 | **Fast file and process work**: builds and test suites close to native speed |
+| R5 | **Reliability over long runs**: recovers by itself from crashes and host restarts, with the disk intact; management-plane failures do not take machines down |
 
-`kubernetes-sigs/agent-sandbox` (a Kubernetes API for stateful agent
-sandboxes, over gVisor or Kata) is worth reusing if Kata or gVisor wins; it is
-an API layer, not a runtime.
+Most agent-sandbox technology is optimized for the opposite: **creating
+short-lived sandboxes fast** — sub-second boots, warm pools, snapshots. Boot
+time barely matters here, because a tenant's machine does not stop (§8).
 
-**Bare metal.** KubeVirt and Kata need KVM. On a cloud VM, or inside WSL2, a
-tenant VM is nested virtualization: it works — checked on the operator's WSL2:
-`/dev/kvm`, `kvm_amd nested=1`, vhost-vsock present — but pays for every VM
-exit and every I/O twice. A used tower server with plenty of RAM gives KVM
-natively for little money (§12).
+### 2.3 The options
+
+**KubeVirt — a full VM per account (the default).** A real VM, e.g. Ubuntu with
+systemd, managed as a Kubernetes `VirtualMachine`. Its root disk is a persistent
+volume, cloned per account from a base image by CDI (Containerized Data
+Importer). It runs on libvirt + QEMU/KVM.
+
+- ✅ **R2:** the whole disk persists. A restart is a real computer rebooting:
+  installed packages, services and configuration are still there.
+- ✅ **R3:** a full OS; Docker, systemd services, cron, anything.
+- ✅ **R4:** root, temp files and caches all sit on a real block disk with a
+  normal filesystem. Nothing goes through a shared-directory path.
+- ✅ **R5:** the most proven shape for long-lived VMs. It is productized as Red
+  Hat OpenShift Virtualization, where enterprises run VMs for months.
+  - A VM runs in its own QEMU process on the node, so KubeVirt's controller,
+    API or node agent restarting — or k3s restarting — does not stop running
+    VMs.
+  - Run strategies restart a VM after a crash or a host reboot.
+  - A guest agent lets a hung VM be detected and restarted.
+- ✅ Features we will want later come with it: disk snapshots; hot-plugging
+  disks, NICs, CPU and memory; GPU passthrough; live migration (once storage is
+  shared).
+- ❌ Heaviest per account: a full OS, roughly 0.5–1 GB more memory than a
+  container, plus one launcher pod per VM.
+- ❌ Slowest to boot by default: firmware, bootloader, a generic cloud image.
+  Fixable the way WSL2 does it — direct kernel boot and a minimal image, so the
+  guest boots in seconds (§3.2).
+- ❌ Most to operate:
+  - VM disk images;
+  - an OS inside every machine that needs its own updates (§13);
+  - KubeVirt and CDI themselves, with care on upgrades;
+  - more tested on OpenShift than on k3s.
+
+**Kata Containers — a container inside a small VM (the fallback).** A pod runs
+in its own lightweight VM through a `RuntimeClass` (QEMU or Cloud Hypervisor
+underneath).
+
+- ✅ A real VM boundary with a container's workflow: OCI images, ordinary pods.
+- ✅ Lighter than a full VM; fast to start (≈ 6 s for a full pod in a 2026
+  third-party test; ≈ 0.2 s for the hypervisor alone).
+- ✅ R4 can be met, but only if both the volume (hot-plugged as `virtio-blk` when
+  its source is a block device) and the container's root filesystem
+  (containerd's devmapper snapshotter) are on block devices. The default puts
+  the root filesystem on `virtio-fs`, which is slow on small-file work —
+  `node_modules`, `git` metadata, `~/.cache`.
+- ❌ **R2 fails:** only the mounted volume persists. The container's root
+  filesystem is rebuilt from the image on every restart, so whatever the user
+  installed is gone.
+- ❌ **R3 is weak:** the guest is a minimal kernel plus a container, not a full
+  OS, so systemd, Docker inside and system services are awkward.
+- ❌ **R5 is less proven:** the VM's life is tied to the pod and the shim, more
+  parts sit inside the guest boundary (agent, shim, hot-plugged devices), and
+  its production use is mostly short-to-medium-lived pods. Compatibility
+  pressure is higher too: Kata, containerd, Kubernetes, the hypervisor and the
+  guest kernel must all match.
+
+**gVisor — a user-space kernel (the baseline).** A pod's system calls are served
+by a kernel written in user space; no VM.
+
+- ✅ Lightest and simplest: plugs straight into Kubernetes, fast to start, little
+  memory, no KVM needed. Native in Kubernetes' `agent-sandbox`.
+- ❌ **R4:** file- and process-heavy work is slower, and some system calls
+  behave differently — the riskiest choice for an agent whose job is building
+  software.
+- ❌ **R2, R3:** a container, with the same limits as Kata.
+- ❌ Not a hypervisor boundary; isolation is good but weaker. Modal, which made
+  gVisor its default, shipped real-VM sandboxes in October 2026.
+
+**Considered, not candidates:**
+
+| Option | Why not, for an always-on cloud computer |
+|---|---|
+| **Firecracker** | Built for AWS Lambda: very fast boots, tiny, very few devices. No hot-plug, no GPU, no live migration, no shared filesystem, and its own orchestration to build. Its strength — creating many short-lived VMs fast — is exactly what we do not need |
+| **Cloud Hypervisor** (directly, or via **Virtink**, a lightweight KubeVirt-like add-on built on it) | Modern, lean, Rust; supports hot-plug, `virtio-fs`, passthrough, even live migration. But libvirt's support for it is new, mainline KubeVirt does not use it, and Virtink's production use is far smaller. An optional entry in the bake-off, not the default |
+| **libkrun** (Microsandbox) | Young; aimed at local and ephemeral sandboxes |
+| **Plain containers (`runc`)** | Not a boundary between tenants: an agent with a shell is arbitrary code |
+| **Hosted sandboxes** (E2B, Daytona, Modal, Northflank) | Priced per second for short sandboxes; always-on machines for every account are expensive, and not self-hosted |
+
+**Why QEMU, which sounds old.** QEMU began as an emulator, but here it does not
+emulate anything that matters for speed:
+
+- **KVM**, in the Linux kernel, virtualizes CPU and memory. The guest's
+  instructions run directly on the real CPU through VT-x / AMD-V.
+- **QEMU** is only the VM manager: it creates the VM and provides devices, and
+  those are paravirtual `virtio` disks and NICs, not emulated hardware.
+- This QEMU/KVM pair is the standard behind OpenStack, Proxmox and many
+  clouds.
+- Compared with Cloud Hypervisor:
+  - **CPU:** the same speed, because KVM does the work in both.
+  - **I/O:** close, both through `virtio` (QEMU can add `vhost`).
+  - **Boot:** Cloud Hypervisor is faster, but boot is rarely on our path.
+- What KubeVirt gets from QEMU and libvirt — snapshots, hot-plug, passthrough,
+  migration, guest-agent integration — matters more for an always-on machine
+  than a leaner VMM.
+- The cost is a larger attack surface. It is mitigated by enabling only
+  `virtio` devices; KubeVirt also runs QEMU in an unprivileged pod under
+  seccomp.
+
+**k3s runs KubeVirt.** KubeVirt is an operator on any conformant Kubernetes:
+an API, a controller, an agent on every node (`virt-handler`), plus CDI. Three
+things to get right:
+
+- **Storage:** k3s's built-in `local-path` is not enough. KubeVirt and CDI want
+  block-mode volumes, cloning and snapshots: TopoLVM, or Longhorn.
+- **Overhead:** KubeVirt's components cost roughly a few hundred MB to 1 GB for
+  the cluster, plus a little per VM. It counts in the capacity math (§8).
+- **Networking:** a VM's network goes through its launcher pod, so k3s's flannel
+  and NetworkPolicy apply as for any pod.
+- **Every node that runs VMs needs `/dev/kvm`.** It is native on bare metal and
+  nested on WSL2 (§3.3).
+
+**Harvester** (SUSE) — Kubernetes (RKE2) + KubeVirt + Longhorn + a VM web UI,
+on its own OS — is the same stack already assembled. It is a reference design
+and a fallback if operating VMs ourselves proves the expensive part, but it is
+heavier and less flexible than plain k3s + KubeVirt.
+
+### 2.4 Start and resume, for reference
+
+Published numbers, on other hardware; ours come from the bake-off.
+
+| | Number |
+|---|---|
+| Kata, hypervisor alone | ≈ 0.2 s (Cloud Hypervisor); a few seconds (QEMU) |
+| Kata, full pod start (2026 third-party test) | ≈ 6.1 s (Cloud Hypervisor), ≈ 7.1 s (QEMU) |
+| KubeVirt, QEMU domain start | ≈ 0.24–0.5 s p50 |
+| KubeVirt, density | 100 VMs ≈ 3.3 min; 200 ≈ 10 min |
+| KubeVirt, guest ready | No good published number. Tens of seconds with a stock cloud image; a few seconds expected with direct kernel boot and a minimal image, as WSL2 shows |
+| Pause / resume | Near-instant for both: memory stays in place |
+| Snapshot restore | Disk-level; restoring means a boot |
+
+Start time is on a user's path only after a host reboot or an image rollout,
+never in normal operation (§8). The measure that matters is **time from host
+reboot until every tenant answers**.
 
 ## 3. v1: experience first, then topology
 
@@ -123,11 +249,36 @@ the same stability.** That decides several things:
 
 ### 3.2 The bake-off
 
-The same gate decides the technology. On the real box, measure **KubeVirt**,
-**Kata** (block-device volume, then `virtio-fs`) and **gVisor** against
-`LocalRuntime` and each other, adding idle memory per tenant. The winner is the
-one that passes the gate with the best stability; ties go to the simplest to
-operate.
+KubeVirt is the default (§2.3); the bake-off validates it on the real box
+against `LocalRuntime`, before the decision is final.
+
+**Entries:**
+
+- **KubeVirt**, with an optimized guest: direct kernel boot, a minimal Ubuntu
+  image without cloud-init, systemd with only what we need, the disk already on
+  a local block volume.
+- **Kata**, the fallback, with both the volume and the root filesystem on block
+  devices — not the defaults.
+- **gVisor**, as the lightweight baseline.
+- Optionally **Virtink** (Cloud Hypervisor).
+
+**Measures**, beyond the gate of §3.1:
+
+- a large `git clone` and a full build of Octopus, with cold and warm caches;
+- idle memory per tenant;
+- **time from host reboot until every tenant answers**, and one machine's
+  restart time;
+- **fault injection** during a multi-day soak:
+  - kill a VM's hypervisor process;
+  - restart k3s;
+  - reboot the host;
+  - fill a tenant's disk;
+  - exhaust a guest's memory.
+
+  For each, record the time to recover and confirm the disk is intact.
+
+KubeVirt becomes final if it passes the gate. Otherwise the first entry that
+passes takes its place, best reliability first, ties to the simplest to operate.
 
 ### 3.3 Topology: one or two nodes
 
@@ -196,8 +347,8 @@ For each account the controller maintains:
 
 | Object | Purpose |
 |---|---|
-| The tenant's machine | A KubeVirt `VirtualMachine`, or a `StatefulSet` (replicas 1) with `runtimeClassName: kata` / `gvisor` — whichever the bake-off picks (§3.2). It stays running (§8); it is stopped only when an account is disabled or a node is drained. |
-| `PersistentVolumeClaim` | The tenant's disk (§6). It outlives any machine; a restarted machine mounts the same volume. |
+| The tenant's machine | By default a KubeVirt `VirtualMachine` with run strategy *Always* (a `StatefulSet` with `runtimeClassName: kata` if the fallback wins, §3.2). It stays running (§8); it is stopped only when an account is disabled or a node is drained. |
+| Root disk (`DataVolume` / PVC) | The machine's whole disk — OS, installed software, `/home/tenant` — cloned per account from the base image by CDI (§6). It outlives any VM; a restarted VM boots from the same disk. |
 | `nodeSelector` | Pins the tenant to the node that holds its volume. |
 | `NetworkPolicy` | What the tenant's machine may reach (§7). |
 | `Secret` | The agent's credential for Octopus → agent calls. |
@@ -232,9 +383,11 @@ k3s API server.
 
 ## 6. Storage: the tenant's disk is the product
 
-Everything a tenant has lives on its volume, mounted at `/home/tenant`:
-workspace, agent memory, Application code and data, uploads, **and the CLIs'
-own state** — Claude's and Codex's logins and transcripts. Losing it, or
+With KubeVirt, the tenant's **whole machine** lives on its disk: the OS and
+everything installed on it, and under `/home/tenant` the workspace, agent
+memory, Application code and data, uploads, **and the CLIs' own state** —
+Claude's and Codex's logins and transcripts. (With the Kata fallback, only the
+mounted volume persists, §2.3.) Losing it, or
 starting a machine without it, signs the tenant out of everything
 (`runtime-providers.md` §5). The conformance case `state_survives_release`
 exists for this.
@@ -242,16 +395,16 @@ exists for this.
 - **Shared pool (Linux box):** an LVM-backed CSI driver (TopoLVM or OpenEBS
   LocalPV-LVM) on the box's NVMe — one logical volume per tenant. Quotas are
   the volume size; snapshots are cheap and atomic, which gives backups and
-  "restore my account". k3s's bundled `local-path` provisioner is fine for the
-  first prototype but has neither quotas nor snapshots, so it is not the
-  serving answer.
+  "restore my computer to yesterday". It supports the block-mode volumes and
+  cloning KubeVirt's CDI needs. k3s's bundled `local-path` provisioner has
+  neither, so it is not the serving answer.
 - **Session history** lives here too. Octopus writes it, as it does today, but
   through a storage operation of the Runtime interface; Octopus's own site keeps
   only metadata, the Ledger and rebuildable indexes (Octopus `docs/roadmap.md`
   item 2).
-- **Storage/compute separation is the recovery model.** The machine is
-  disposable; the volume is the product. A crashed machine restarts and mounts
-  the same volume.
+- **Storage/compute separation is the recovery model.** The VM process is
+  disposable; the disk is the product. A crashed VM restarts and boots from
+  the same disk.
   A lost node is restored from off-box backups onto another. How exactly — the
   volume's way into the VM, its layout, snapshots, backups and restore — is the
   open design of §13 item 2.
@@ -386,10 +539,10 @@ No GPU; modest CPU; memory is what runs out first.
 
 ## 13. Open questions — for discussion
 
-1. **The isolation technology** — KubeVirt, Kata or gVisor, by the bake-off
-   (§3.2).
-2. **Virtualization and the persistent volume, in detail** — the next design to
-   write, once (1) is known:
+1. **The isolation technology, final** — KubeVirt by default, confirmed or
+   replaced by the bake-off (§3.2).
+2. **Virtualization and the persistent disk, in detail** — the next design to
+   write, once (1) is final:
    - how the volume enters the tenant's machine (block device, `virtio-blk`, vs.
      shared directory, `virtio-fs`);
    - its layout and filesystem;
@@ -400,12 +553,20 @@ No GPU; modest CPU; memory is what runs out first.
    - restore, with recovery-point and recovery-time targets;
    - resize, encryption at rest, and moving a volume between nodes.
 3. **The operator's PC** — Device or second Runtime node (§3.3).
-4. **Storage driver** — TopoLVM vs. OpenEBS LocalPV-LVM (or KubeVirt's
-   CDI-managed disks, if KubeVirt wins).
-5. **The tenant image** — who updates the CLIs, how often, and how a running
-   machine picks up a new version without a cold start in front of a user.
+4. **Storage driver** — TopoLVM vs. OpenEBS LocalPV-LVM vs. Longhorn, under
+   CDI.
+5. **Updates on a machine that diverges.** Each account's OS changes as the user
+   uses it, so "update by rebuilding the image" no longer works. Expected
+   policy, to settle:
+   - OS security updates inside each VM (unattended upgrades, with reboots
+     scheduled out of hours);
+   - our agent and the CLIs (Claude, Codex) updating themselves in place;
+   - the base image affecting only new accounts.
 6. **Root inside the tenant's machine** — it is the tenant's own machine, and
-   package installs want root; the boundary is the VM (or gVisor).
+   package installs want root; the boundary is the VM.
+7. **Direct access for the user** — a terminal or SSH to their own cloud
+   computer, not only through their agents. Natural for a cloud computer; a
+   product and security decision.
 
 ## 14. Order of work
 
@@ -413,13 +574,13 @@ No GPU; modest CPU; memory is what runs out first.
    `KubeRuntime`'s execution path, with tenant machines replaced by a local
    process per tenant — pass the Octopus conformance suite first.
 2. **The box and the bake-off.**
-   - k3s and the three candidates on the real box.
+   - k3s, KubeVirt (the default) and the other entries on the real box.
    - The parity benchmark of §3.1 against `LocalRuntime`.
-   - The choice (§3.2).
+   - Confirm KubeVirt, or take the fallback (§3.2).
    - If the operator's PC is to be a node, the nested-virtualization run of
      §3.3 is part of this step.
-3. **Virtualization and volumes in detail** (§13 item 2), for the winner; the
-   controller with its per-tenant objects.
+3. **Virtualization and disks in detail** (§13 item 2), for the confirmed
+   technology; the controller with its per-tenant objects.
 4. **Octopus file operations and the history store** (`runtime-1.1`),
    implemented in `LocalRuntime` and the agent.
 5. **Admin console.**
@@ -453,7 +614,14 @@ No GPU; modest CPU; memory is what runs out first.
 - **RuntimeClass** — per-pod choice of how containerd runs it: `runc` (ordinary
   container), `kata` (inside a VM) or `gvisor` (on a user-space kernel).
 - **KubeVirt** — runs full virtual machines as Kubernetes objects
-  (`VirtualMachine`), with disks on persistent volumes.
+  (`VirtualMachine`), with disks on persistent volumes; built on libvirt and
+  QEMU/KVM.
+- **CDI / DataVolume** — KubeVirt's Containerized Data Importer; a DataVolume is
+  a VM disk it imports or clones onto a PVC.
+- **QEMU** — the VM manager that creates VMs and provides their `virtio`
+  devices; with KVM it emulates no CPU.
+- **Cloud Hypervisor, Firecracker** — leaner VM managers on KVM; Firecracker is
+  built for short-lived serverless VMs.
 - **gVisor** — a user-space kernel that intercepts a container's system calls;
   stronger than a container, weaker than a VM.
 - **StatefulSet** — keeps a fixed, named pod (here: one per tenant) with its

@@ -39,8 +39,8 @@ The dependency runs one way:
   `PROTOCOL_VERSION` it implements and is gated on passing that version's
   conformance suite. Catching up with a new standard is work on this side.
 - **Never ahead of `LocalRuntime`.** Anything this platform needs from the
-  standard — file operations (§11), an offline `ensure`, session history kept
-  in the runtime — is proposed to Octopus and lands there, with its
+  standard — file operations (§11), an `ensure` that reports an outage, session
+  history kept in the runtime — is proposed to Octopus and lands there, with its
   `LocalRuntime` implementation, before it is consumed here.
 
 ## 2. Technology choice
@@ -61,23 +61,18 @@ The choice is per pod, so one cluster runs both.
 
 Why this pair, for the deployment we actually have (§3):
 
-- **Heterogeneous nodes are the starting point, not a later scaling problem.**
-  Most accounts get a Kata VM on the bare-metal box; the operator's own account
-  runs on the operator's own PC. k3s places each tenant on the right node with
-  labels, `nodeSelector` and taints, and runs it the right way with
-  `RuntimeClass`. Writing that placement, the node agents and the cross-node
-  networking ourselves would be the larger project.
-- **Isolation where it is needed, none where it is not.** Other people's
-  accounts get a VM boundary (`kata`). The operator's account, on the
-  operator's machine, runs as a plain container (`runc`) — near-native, and no
-  virtualization nested inside WSL's own VM.
+- **One way to run a tenant, on any node.** Every account — the operator's
+  included — gets a Kata VM. A second node, whether a second box or a machine at
+  home, joins the same way and is not special (§9). k3s does the placement,
+  pins a tenant to the node that holds its volume, and runs the cross-node
+  networking. Writing that ourselves would be the larger project.
 - **Mature pieces we would otherwise build:** persistent volumes, network
   policy (k3s ships a policy controller), service discovery, health checks,
   and tooling an operator already knows (`kubectl`, k9s, Headlamp).
 
 | Isolation option | Boundary | Verdict |
 |---|---|---|
-| Plain containers (runc) | shared kernel | Not a boundary between tenants — an agent with a shell is arbitrary code. Fine for the operator's own account on the operator's own machine. |
+| Plain containers (runc) | shared kernel | Not a boundary between tenants — an agent with a shell is arbitrary code. |
 | gVisor | user-space kernel | Strong, but syscall compatibility and I/O performance matter for an agent running builds, `git`, `npm`, test suites. |
 | Raw Firecracker / Cloud Hypervisor | VM | Same isolation as Kata, but we would rebuild images, networking and the guest agent ourselves. |
 | **Kata Containers** | **VM** | VM boundary that plugs into containerd and therefore into k3s, per pod. |
@@ -102,30 +97,24 @@ KVM natively for little money (§12).
  │  Octopus site: sessions metadata · schedules · Applications · MCP · DB         │
  │  runtime_provider = "octopus_runtime.provider:KubeRuntime"                     │
  │  octopus-runtime controller + admin console                                    │
- │  k3s server ─────────────────────────────────────────────┐                     │
- │  k3s agent (this node: label octopus/pool=shared)       │                     │
- │   ┌── pod tenant B (kata) ──┐ ┌── pod tenant C (kata) ──┐ │  ...               │
- │   │ VM: octopus-runtime-    │ │ VM: octopus-runtime-    │ │                    │
- │   │ agent, claude, codex,   │ │ agent, claude, codex,   │ │                    │
- │   │ /home/tenant ◄─ PVC B   │ │ /home/tenant ◄─ PVC C   │ │                    │
- │   └─────────────────────────┘ └─────────────────────────┘ │                    │
- └─────────────────────────────────────────────────────────────┼────────────────────┘
-                              home LAN                         │ k3s: 6443, 10250,
- ┌──────────────────────── Windows PC ──────────────────────────▼─ flannel ────────┐
- │  Windows: the operator's daily machine                                          │
- │  WSL2 distro "octopus-node": k3s agent (label octopus/owner=<operator id>)      │
- │   ┌── pod tenant A — the operator (runc) ──┐                                    │
- │   │ octopus-runtime-agent, claude, codex   │                                    │
- │   │ /home/tenant ◄─ local volume on WSL    │                                    │
- │   └────────────────────────────────────────┘                                    │
- └─────────────────────────────────────────────────────────────────────────────────┘
+ │  k3s server + agent (this node: label octopus/pool=shared)                     │
+ │   ┌── pod tenant A (kata) ──┐ ┌── pod tenant B (kata) ──┐                       │
+ │   │ VM: octopus-runtime-    │ │ VM: octopus-runtime-    │   ...                 │
+ │   │ agent, claude, codex,   │ │ agent, claude, codex,   │                       │
+ │   │ /home/tenant ◄─ PVC A   │ │ /home/tenant ◄─ PVC B   │                       │
+ │   └─────────────────────────┘ └─────────────────────────┘                       │
+ └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **The Linux box** runs everything that must be always on: the Octopus site
-  (and its public tunnel), the k3s server, the controller and admin console,
-  and the Kata VMs of every account except the operator's.
-- **The Windows PC** stays a Windows PC. A dedicated WSL2 distro joins the
-  cluster as a k3s agent and runs exactly one tenant: the operator's own.
+- **The Linux box** runs everything that must be always on: the Octopus site and
+  its public tunnel, the k3s server, the controller and admin console, and a
+  Kata VM for every account — the operator's included.
+- **Every Runtime node is always on.** A node that may go offline is not a
+  Runtime node (§9).
+- **The operator's Windows PC stays a Windows PC.** It uses Octopus through the
+  browser. If its agents should reach it, it joins Octopus as a **Device** (the
+  agent's hands, allowed to go offline — Octopus's `docs/plans/devices.md`), not
+  as a Runtime.
 
 ### Components in this repository
 
@@ -157,23 +146,21 @@ For each account the controller maintains:
 
 | Object | Purpose |
 |---|---|
-| `StatefulSet` (replicas 0 or 1) | The tenant's machine. 1 = running, 0 = released. `runtimeClassName: kata` for the shared pool, `runc` for an owner node. |
-| `PersistentVolumeClaim` | The tenant's disk (§6). Survives replicas going to 0 — that is what `release` means. |
-| `nodeSelector` + toleration | Pins the tenant to its pool: `octopus/pool=shared`, or `octopus/owner=<account id>` for a brought machine. |
+| `StatefulSet` (replicas 1) | The tenant's machine, `runtimeClassName: kata`. It stays running: `release` reclaims its resources, it does not stop it (§8). Replicas 0 only when an account is disabled or a node is drained. |
+| `PersistentVolumeClaim` | The tenant's disk (§6). It outlives any VM; a restarted VM mounts the same volume. |
+| `nodeSelector` | Pins the tenant to the node that holds its volume. |
 | `NetworkPolicy` | What the pod may reach (§7). |
 | `Secret` | The agent's credential for Octopus → agent calls. |
 | `ResourceQuota` / limits | CPU, memory, ephemeral storage per tier (§8). |
 
-A brought machine is **tainted** (`octopus/owner=<id>:NoSchedule`) so nothing
-else is ever scheduled onto it, and its tenant has the matching toleration and
-no other eligible node — so it can never be moved somewhere its disk is not.
+A tenant can never be scheduled somewhere its disk is not.
 
 ## 5. The protocol, mapped
 
 | Protocol call | What happens here |
 |---|---|
-| `ensure(tenant)` | Controller: scale the tenant's StatefulSet to 1 and wait until the agent answers. Idempotent; concurrent calls share one wait. Fails fast with a clear "runtime offline" if the tenant's node is `NotReady` (§9). |
-| `release(tenant)` | Scale to 0. **The PVC stays.** Octopus calls this only when the tenant has nothing running, after its grace period. |
+| `ensure(tenant)` | Controller: confirm the tenant's VM is up and its agent answers, restoring the resources `release` reclaimed. Normally immediate. A VM that is not running (after a host restart or maintenance) is started and waited for. Idempotent; concurrent calls share one wait. A node that is down is an outage (§6), reported as one rather than hung on. |
+| `release(tenant)` | **Reclaim, don't stop.** The VM keeps running; its idle memory goes back to the host (balloon / free-page reporting, §8). The PVC is untouched. Octopus calls this only when the tenant has nothing running, after its grace period. |
 | `exec(spec)` | Provider → agent: start `argv` with exactly `spec.env` (nothing added), `cwd`, the stdin/stderr modes, its own process group if asked. Streams are multiplexed (stdin, stdout, stderr, signal, exit) over one WebSocket or gRPC stream. |
 | `Execution.signal(sig, group)` | A frame on that stream; the agent does `killpg` in the pod. Returns as soon as the frame is sent. |
 | `expose(tenant)` | Controller picks a free port for the pod; returns `(port, "<pod IP>:<port>")`. The pod IP is reachable from the Octopus host over the cluster network. |
@@ -190,8 +177,8 @@ Octopus depends on two behaviours the generic exec path does not give cleanly �
   stdin open, and is written to again minutes later.
 
 An agent we own implements exactly the protocol's semantics, is tested by the
-same conformance suite, works the same under `kata` and `runc`, and does not
-route every turn's output through the k3s API server.
+same conformance suite, and does not route every turn's output through the
+k3s API server.
 
 ## 6. Storage: the tenant's disk is the product
 
@@ -208,8 +195,15 @@ exists for this.
   "restore my account". k3s's bundled `local-path` provisioner is fine for the
   first prototype but has neither quotas nor snapshots, so it is not the
   serving answer.
-- **Brought machine (WSL):** a local volume on the WSL distro's own disk. The
-  data never leaves the operator's PC.
+- **Session history** lives here too. Octopus writes it, as it does today, but
+  through a storage operation of the Runtime interface; Octopus's own site keeps
+  only metadata, the Ledger and rebuildable indexes (Octopus `docs/roadmap.md`
+  item 2).
+- **Storage/compute separation is the recovery model.** The VM is disposable;
+  the volume is the product. A crashed VM restarts and mounts the same volume.
+  A lost node is restored from off-box backups onto another. How exactly — the
+  volume's way into the VM, its layout, snapshots, backups and restore — is the
+  open design of §13.
 
 Local volumes pin a tenant to its node; for the shared pool that is one box
 today. Network storage (Ceph, Longhorn) removes the pin and adds a distributed
@@ -219,18 +213,13 @@ system to operate — decide when there is a second Kata node (§11).
 
 ### Between the machines (k3s)
 
+One node today. A second node opens these, between the nodes only:
+
 | Port | Direction | What |
 |---|---|---|
-| TCP 6443 | WSL node → Linux box | k3s agent to API server |
-| TCP 10250 | Linux box → WSL node | API server to kubelet (logs, health) |
-| UDP 8472 (VXLAN) or UDP 51820 (WireGuard) | both ways | the pod network (flannel) |
-
-**The WSL node needs inbound rules.** The operator's WSL runs with
-`networkingMode=mirrored` and `firewall=true`: the distro shares the PC's LAN
-address, and the Hyper-V firewall drops unsolicited inbound by default. 10250
-and the flannel port must be allowed **from the Linux box's address only**.
-Flannel's WireGuard backend is preferable on a home LAN: one UDP port, and pod
-traffic between the machines is encrypted.
+| TCP 6443 | agent node → server | k3s agent to API server |
+| TCP 10250 | server → agent node | API server to kubelet (logs, health) |
+| UDP 51820 (WireGuard) | both ways | the pod network (flannel's WireGuard backend: one port, encrypted) |
 
 ### What a tenant pod may reach (NetworkPolicy + node nftables)
 
@@ -248,13 +237,20 @@ the public entry point stays the one cloudflared tunnel to the site.
 
 ## 8. Lifecycle and capacity
 
-- **Octopus decides when.** `ensure` before every execution, `release` after
-  the tenant has had nothing running for `runtime_release_grace_seconds`
-  (default 5 min). The controller does not run its own idle timer.
-- **Cold start is on the critical path only for an idle tenant.** A scheduled
-  fire for a released tenant pays it; an active conversation never does.
-  Target: pod scheduled, VM booted and agent answering in a few seconds — to be
-  measured on the real box, not assumed.
+- **A Runtime is always on.** Every tenant's VM keeps running: stopping it would
+  end its held CLI processes and put a cold start in front of every scheduled
+  fire and every first message.
+- **Octopus decides when to reclaim.** `ensure` before every execution;
+  `release` after the tenant has had nothing running for
+  `runtime_release_grace_seconds`. `release` hands the idle VM's memory back to
+  the host — balloon / free-page reporting — and costs no stop and no cold start.
+  The controller runs no idle timer of its own.
+- **Capacity depends on reclaim working.** An idle VM must settle at its working
+  set, not creep up to its limit through page cache. Measure it on the real box
+  before selling a tier, and keep measuring (§13).
+- **A cold start happens only after a host restart, maintenance or an image
+  update**, never in normal operation. It is still measured, and its path kept
+  correct, because recovery depends on it.
 - **Sizing.** Tiers by CPU / memory limits — 2 / 4 GB default, 4 / 8 GB larger.
   vCPUs oversubscribe well (agents mostly wait on a model). Memory does not
   oversubscribe for free: a Kata VM's memory is held by the hypervisor unless
@@ -264,43 +260,36 @@ the public entry point stays the one cloudflared tunnel to the site.
   tenants per node, per-tenant disk quota, a ceiling on how long a pod may run
   with no exec (catches a lost `release`).
 
-## 9. The owner's machine
+## 9. Runtime nodes are always on
 
-The operator's own account runs on the operator's PC, in a WSL2 distro joined
-to the cluster. What that needs, and what it changes:
+A Runtime is where sessions live, so a Runtime node is **always on**: its going
+down is an outage the platform recovers from, never a state the design plans
+for. This decides what a machine outside the box can be.
 
-- **A dedicated distro** (`octopus-node`), not the one used day to day. The
-  k3s agent writes iptables rules and creates interfaces; a separate distro does
-  not isolate the network stack (all WSL2 distros share one), but it keeps the
-  agent's packages, services and disk out of the daily environment. The tenant
-  pod does **not** mount `/mnt/c`, so the agent cannot reach Windows files.
-- **`runc`, not `kata`.** It is the operator's own account on the operator's own
-  machine; a VM boundary would only add nested virtualization.
-- **When the PC is off, the runtime is offline.** k3s marks the node
-  `NotReady`; because the tenant is pinned (§4), its pod stays Pending rather
-  than being rescheduled onto a node without its disk. `ensure` fails fast with
-  "runtime offline", and Octopus must surface that — in the chat, and for a
-  scheduled fire as a failed run with that reason — instead of hanging. The
-  operator's scheduled work (nightly checks, mail triage, daily refreshes)
-  therefore needs a policy (§11): keep the PC on, Wake-on-LAN plus a Windows
-  task that starts WSL at boot, or move scheduled work to a shared-pool pod.
-- **Bring-your-own machine is the general case of this.** Nothing here is
-  specific to the operator: any account could attach its own Linux machine as
-  a pinned `runc` node. Whether that becomes a product feature is a separate
-  decision.
+- **A machine that should host sessions joins as a Runtime node** — virtualized
+  with Kata like every other node, managed by k3s, held to "always on", and not
+  treated as special because of who owns it. It needs bare-metal KVM. A
+  Windows PC's WSL2 would mean nested virtualization, and it is not a machine
+  that stays on.
+- **A machine that comes and goes is a Device**, not a Runtime: the agent's
+  hands, reached from its Runtime, allowed to be offline (Octopus
+  `docs/plans/devices.md`).
+- **No hybrid.** An offline-able home for sessions would need offline policies
+  for turns, schedules and history. That is the complexity this rule exists to
+  avoid.
 
 ## 10. Admin console
 
 An operator-facing web UI served by the controller — separate from Octopus's
 own Monitor page, which is about one install, not the fleet.
 
-- **Tenants** — every account: state (running / released / starting /
-  offline / failed), node, tier, volume usage, last active, running executions
-  (turns, background tasks, Application backends).
+- **Tenants** — every account: state (running / reclaimed / starting /
+  failed), node, tier, memory held vs. limit, volume usage, last active, running
+  executions (turns, background tasks, Application backends).
 - **Nodes** — each machine: Ready / NotReady, tenants on it, CPU / memory /
   disk committed vs. physical.
-- **Events** — starts, releases, failed starts, OOM kills, quota hits, a
-  brought machine going offline, with the agent's last output for a failure.
+- **Events** — starts, reclaims, failed starts, OOM kills, quota hits, a node
+  going down, with the agent's last output for a failure.
 - **Actions** — stop a tenant, resize, snapshot / restore its volume, cordon or
   drain a node.
 - **Metrics** — start latency, running tenants, memory overcommit over time.
@@ -328,9 +317,13 @@ remain, and each one breaks this provider immediately:
    operator's `OCTOPUS_AUTH_TOKEN` into a tenant's pod.
 3. **Fork as a runtime step** (step 9) — the transcript copy runs in the pod.
 
-Plus one new behaviour: **`ensure` can fail** with "runtime offline" (§9), and
-every caller — a turn, a scheduled fire, a delegation — must report it rather
-than hang.
+Plus two more:
+
+- **Session history through the Runtime's storage**, written by Octopus as today
+  (§6).
+- **An outage is reported, not hung on.** A Runtime is always on by assumption,
+  but a node can still fail; every caller — a turn, a scheduled fire, a
+  delegation — reports it.
 
 ## 12. Hardware for the Linux box
 
@@ -345,21 +338,26 @@ No GPU; modest CPU; memory is what runs out first.
 
 ## 13. Open questions — for discussion
 
-1. **The operator's offline policy** (§9): keep the PC on, Wake-on-LAN, or
-   scheduled work in the shared pool?
-2. **k3s on WSL2 with mirrored networking** — expected to work, not yet proven.
-   The first thing to test once the box exists (§14 step 3).
-3. **Memory overcommit** — how much, with which mechanism (balloon, free page
-   reporting, KSM — and KSM's cross-tenant side-channel concern)?
-4. **Storage** — TopoLVM vs. OpenEBS LocalPV-LVM; and when local volumes stop
+1. **Virtualization and the persistent volume, in detail** — the next design
+   to write:
+   - how the volume enters the Kata VM (block device, `virtio-blk`, vs. shared
+     directory, `virtio-fs`);
+   - its layout and filesystem;
+   - snapshot schedule and retention, and off-box backups, so a lost node is
+     not lost data;
+   - SQLite consistency in a snapshot (WAL plus a filesystem freeze, or the
+     backup API);
+   - restore, with recovery-point and recovery-time targets;
+   - resize, encryption at rest, and moving a volume between nodes.
+2. **Memory reclaim** — balloon vs. free-page reporting, the guest kernel
+   settings, and proof that an idle VM's memory really returns; how far to
+   overcommit; KSM's cross-tenant side-channel concern.
+3. **Storage** — TopoLVM vs. OpenEBS LocalPV-LVM; and when local volumes stop
    being enough.
-5. **The tenant image** — who updates the CLIs, how often, and does a running
-   tenant pick up a new version on its next `ensure`?
-6. **Root inside the tenant pod** — the tenant's own machine, and package
+4. **The tenant image** — who updates the CLIs, how often, and how a running VM
+   picks up a new version without a cold start in front of a user.
+5. **Root inside the tenant pod** — the tenant's own machine, and package
    installs want it; the boundary is the VM.
-7. **Bring-your-own machine as a feature** for other accounts (§9).
-8. **Where session history lives** — on the tenant's volume with metadata on
-   the site, and how history is read while a tenant is released.
 
 ## 14. Order of work
 
@@ -369,11 +367,10 @@ No GPU; modest CPU; memory is what runs out first.
 2. **The Linux box.** k3s server + agent, Kata with Cloud Hypervisor, the LVM
    CSI driver, the controller (StatefulSet / PVC / NetworkPolicy per tenant).
    Conformance against real Kata pods; measure cold start and per-VM memory.
-3. **The WSL node.** Dedicated distro, k3s agent, Hyper-V firewall rules,
-   WireGuard flannel, taint + pinning, `runc`. Conformance against the
-   operator's node; verify the offline behaviour (§9).
-4. **Octopus file operations** (`runtime-1.1`) — designed with both node kinds
-   in view, implemented in `LocalRuntime` and the agent.
+3. **Virtualization and volumes in detail** (§13 item 1), and memory reclaim
+   proven on the box (§13 item 2).
+4. **Octopus file operations and the history store** (`runtime-1.1`),
+   implemented in `LocalRuntime` and the agent.
 5. **Admin console.**
 6. **Move the site** to the Linux box (DB, master key, cloudflared tunnel), with
    a rollback path; migrate each account's data onto its volume.

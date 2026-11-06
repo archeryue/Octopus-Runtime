@@ -9,10 +9,10 @@ without this; this platform follows the standard.
 
 > **Status:** design. Nothing here runs yet. The interface it implements is
 > specified in Octopus under
-> [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/main/docs/plans/runtime-providers.md);
+> [`docs/plans/runtime-providers.md`](https://github.com/archeryue/Octopus/blob/runtime-provider/docs/plans/runtime-providers.md);
 > how this repository implements it is [`docs/design.md`](docs/design.md) —
-> k3s with Kata Containers on a bare-metal box, one lightweight VM per account,
-> an owner's own machine joinable as a node, a controller and an admin console.
+> k3s with Kata Containers on bare metal, one always-on lightweight VM per
+> account, a controller and an admin console.
 
 ## Why this exists
 

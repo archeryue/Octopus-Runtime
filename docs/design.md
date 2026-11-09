@@ -1,7 +1,9 @@
 # Octopus-Runtime — design
 
-> **Status:** draft for discussion (revised 2026-11-08). Nothing here is built. The
-> interface this implements is `server/runtime/base.py` in Octopus
+> **Status:** draft for discussion (revised 2026-11-08). Nothing here is built.
+> **The technology is not decided:** two candidates stay open, PVE + k3s and
+> k3s + Kata (§2.3, §2.7), and need more research. The interface this
+> implements is `server/runtime/base.py` in Octopus
 > (`PROTOCOL_VERSION = "runtime-1.0"`), and the conformance suite there
 > (`server/runtime/conformance.py`) is the contract.
 
@@ -44,9 +46,17 @@ The dependency runs one way:
 
 ## 2. Technology choice
 
-**Proxmox VE (PVE) on bare metal runs every tenant's VM. k3s runs inside one or
-two PVE VMs, for everything that needs containers.** Each layer does the one
-thing it is best at.
+**Not decided. Two candidates are open:**
+
+- **A — PVE + k3s.** Proxmox VE (PVE) on bare metal runs every tenant's VM; k3s
+  runs inside one or two PVE VMs, for everything that needs containers (§2.2).
+- **B — k3s + Kata.** k3s on bare metal; each tenant's machine is a pod run by
+  Kata Containers, with its root and data on block devices (§2.7).
+
+The earlier verdict that Kata fails R2 was wrong: it rested on Kata's defaults,
+not on what Kata can be configured to do. §2.7 records where the two candidates
+are equal, where they differ, and the research that decides between them.
+Sections 3–13 are written against A for now; §2.7 lists what changes under B.
 
 ### 2.1 What a tenant's machine is: a cloud computer
 
@@ -73,7 +83,7 @@ Most agent-sandbox technology is optimized for the opposite: **creating
 short-lived sandboxes fast** — sub-second boots, warm pools, snapshots. Boot
 time barely matters here, because a tenant's machine does not stop (§9).
 
-### 2.2 The design: PVE for VMs, k3s inside for containers
+### 2.2 Candidate A: PVE for VMs, k3s inside for containers
 
 | Layer | Runs | Driven by |
 |---|---|---|
@@ -102,11 +112,11 @@ Why this split:
 
 | Option | Verdict |
 |---|---|
-| **PVE for VMs + k3s in a VM for containers** | **Default.** Best fit for R1–R5 with the least machinery between a tenant and the hardware; backups and operations solved; containers kept |
+| **A: PVE for VMs + k3s in a VM for containers** | **Candidate.** Meets R1–R5 out of the box, with the least machinery between a tenant and the hardware; backups and operations solved; containers kept. Two systems to run |
+| **B: k3s + Kata** (a tenant's machine is a Kata pod) | **Candidate.** Meets R1–R5 *when configured for it*: root and data on block devices, guaranteed QoS, Docker in a privileged container on a guest kernel built for it. One control plane, sub-second starts. Cannot snapshot memory or live-migrate. Details in §2.7 |
 | **k3s + KubeVirt** (VMs as Kubernetes objects) | The previous default. Meets R1–R5, and its management plane failing does not stop running VMs. But it puts a pod, the pod network and cgroup accounting around every VM; storage needs a block-capable CSI driver plus CDI; backups must be assembled. **Kept for one future use:** a provider for enterprises whose platform is already Kubernetes or OpenShift (OpenShift Virtualization is KubeVirt), e.g. Kraken private deployments |
 | **Incus** (community fork of LXD) | API-first, projects as tenant boundaries, storage-pool snapshots, fewer layers. Close to PVE in fit; PVE wins on backups (PBS), operator UI and breadth of production use |
 | **Harvester** (SUSE: RKE2 + KubeVirt + Longhorn) | The KubeVirt route already assembled. Heavier, and still pod-wrapped VMs |
-| **Kata Containers** | A container inside a small VM. **Fails R2**: the container's root filesystem is rebuilt from the image on every restart. Weak on R3: a minimal guest, not a full OS. Builds are fast only if both the volume and the root filesystem are on block devices |
 | **gVisor** | A user-space kernel, not a VM. Slower on file- and process-heavy work (R4), with system calls that sometimes differ; a container (R2, R3); weaker isolation |
 | **Firecracker** | Built for short-lived serverless VMs: very fast boots, very few devices, no hot-plug or GPU, its own orchestration to build. Its strength is what we do not need |
 | **Cloud Hypervisor** (or Virtink, built on it) | Modern and lean, but newer in libvirt, not used by mainline KubeVirt or PVE, and with far less production use |
@@ -208,6 +218,89 @@ marked "measured" as a row of its matrix:
 Targets are set before the run: disk and network within a few percent of the
 bare host, builds within the §3.1 margin.
 
+### 2.7 Open: A (PVE + k3s) or B (k3s + Kata)
+
+**Candidate B.** k3s runs on the bare metal. A tenant's machine is a pod whose
+`runtimeClassName` is Kata, so it gets its own guest kernel in its own VM:
+
+- **Root:** on a block device, through the devmapper snapshotter or a root
+  filesystem kept on a raw-block PVC.
+- **Data:** on raw-block PVCs (`volumeMode: Block`), formatted inside the guest.
+- **QoS:** Guaranteed, with a high PriorityClass.
+- **Hypervisor under Kata:** Cloud Hypervisor or QEMU, to be chosen.
+
+**Where A and B are equal**, once B is configured:
+
+- **CPU and memory:** both are KVM.
+- **Disk:** both are `virtio-blk` on local NVMe. B's default, a shared
+  filesystem (`virtio-fs`), costs a round trip to the host on every metadata
+  operation and is several times slower on small-file work. It is a default,
+  not a limit: B takes it off the hot path.
+- **Network:** B adds a CNI hop (veth and tc into the guest's tap). It costs a
+  little latency and throughput, not a hard difference.
+
+**What B has to build to meet R1–R5.** These come free or nearly free in A:
+
+| Requirement | What B needs |
+|---|---|
+| R2, the whole machine persists | The writable root must outlive the container. Kata's default discards it with the container |
+| R3, Docker and systemd | Docker in a privileged container; inside Kata that privilege stops at the guest. Needs a guest kernel built with overlay, netfilter and cgroup support, and `dockerd`'s data on a block device. systemd is not PID 1 |
+| R1 and R5, never stopped from outside | The kubelet evicts pods under node pressure. Guaranteed QoS, PriorityClass and node headroom make that unlikely, not impossible |
+| R5, backups | CSI volume snapshots plus a backup tool (Velero or similar), in place of PBS |
+| Operations | A console and a debug path into a tenant's machine, in place of PVE's UI |
+
+**What B cannot do, however it is managed:**
+
+- **Snapshot or suspend a running machine with its memory.** Kata has no
+  production checkpoint and restore. A can.
+- **Live migration.** Host maintenance restarts every tenant on that host,
+  including upgrades of Kata, containerd and k3s. In v1 this hardly separates the
+  two: A also needs at least two machines plus shared or replicated storage to
+  migrate (§16), and v1 has one. It matters once there is a cluster.
+- **Bypassing the shim.** Kata owns the VM through its shim and the in-guest
+  agent. The hypervisor's own socket is reachable on the host, but driving it
+  directly leaves Kata's state inconsistent, so it is not a supported control
+  path.
+
+**What B brings:**
+
+- One control plane, Kubernetes, for both containers and tenant machines,
+  instead of PVE plus a k3s VM.
+- Sub-second starts. Little needed while machines are always on; valuable if
+  reclaim or on-demand machines arrive later (§16).
+- Image-based templates and rollout.
+- A shape that carries over to enterprise Kubernetes platforms (§16).
+
+**Research that decides it.** Each item is run on the real box; A's
+counterparts are part of §3.2.
+
+1. **Root persistence in B:** install packages, change configuration, restart
+   the pod and reschedule it. Everything must survive.
+2. **Docker and services in B:** `docker run` and `docker build` inside a tenant
+   machine, a service that has to stay up, and the guest kernel this needs.
+3. **The same benchmarks on A and B:** `fio`, a large `git clone`, `npm install`
+   plus a test suite, and a full Octopus build, cold and warm. B is measured
+   with block devices and, for the record, with `virtio-fs`.
+4. **The same fault injection on A and B** (§3.2), plus B's own: kill the Kata
+   shim, the in-guest agent and the kubelet; restart containerd; push the node
+   into memory and disk pressure.
+5. **Upgrades:** what a Kata, containerd or k3s upgrade does to running tenant
+   machines.
+6. **Backup and restore in B:** restore a tenant's machine from a snapshot to a
+   working state.
+7. **The engineering bill:** what the B column above costs to build and run,
+   against A's two systems.
+
+**If B is chosen, sections 3–13 change:**
+
+- Topology (§3.3): no PVE, no k3s VM; k3s on the host.
+- Components (§3.4): the controller drives Kubernetes only.
+- Per-tenant objects (§4): a pod, PVCs and a NetworkPolicy, instead of a VM.
+- Storage and backups (§6): a CSI driver and snapshots, instead of LVM-thin or
+  ZFS plus PBS.
+- Network (§7): NetworkPolicy, instead of the PVE firewall.
+- Admin console (§11): built from Kubernetes objects.
+
 ## 3. v1: experience first, then topology
 
 ### 3.1 The v1 priority is experience parity
@@ -231,7 +324,9 @@ the same stability.** That decides several things:
 
 ### 3.2 The validation run
 
-The design is validated on the real box before the decision is final.
+The design is validated on the real box before the decision is final. **Both
+candidates (§2.7) go through the same run**, configured as well as each allows,
+and the technology is chosen on its results.
 
 - **Configurations measured:** the "measured" rows of §2.6 — LVM-thin vs. ZFS,
   `virtio-scsi-single` vs. `virtio-blk`, `io_uring` vs. `native`, huge pages,
@@ -251,8 +346,9 @@ The design is validated on the real box before the decision is final.
     - exhaust a guest's memory;
     - restore a tenant from PBS.
 
-PVE becomes final if it passes. If it does not, k3s + KubeVirt (§2.3) is the
-fallback, measured the same way.
+The fault-injection list above is written for A. B runs its counterparts, plus
+the extra items in §2.7. If neither candidate passes, k3s + KubeVirt (§2.3) is
+the fallback, measured the same way.
 
 ### 3.3 Topology
 
@@ -546,6 +642,9 @@ PVE**.
 
 ## 14. Open questions — for discussion
 
+0. **A (PVE + k3s) or B (k3s + Kata)** — the first decision. It needs the
+   research in §2.7. Items 1 and 2 below are A's; under B they become the CSI
+   driver and the backup tool.
 1. **LVM-thin or ZFS** for tenant disks (§6, measured).
 2. **PBS placement and off-site copy** — second disk vs. second machine; PBS's
    S3-compatible datastore vs. `rclone` / `restic` to TOS; retention.
@@ -566,21 +665,25 @@ PVE**.
 
 ## 15. Order of work
 
-1. **Agent + provider + conformance, no PVE.** `octopus-runtime-agent` and
-   `PveRuntime`'s execution path, with tenant VMs replaced by a local process
-   per tenant — pass the Octopus conformance suite first.
-2. **The box.**
+1. **Agent + provider + conformance, no hypervisor.** `octopus-runtime-agent`
+   and the provider's execution path, with tenant machines replaced by a local
+   process per tenant — pass the Octopus conformance suite first. This does not
+   depend on the A/B decision.
+2. **Decide A or B.** Prototype both on the box: the research of §2.7 and the
+   validation run of §3.2 for each.
+3. **The box**, for the chosen candidate. Written here for A:
    - PVE installed; the tenant template; the tenant bridge and firewall rules.
    - The k3s VM, with the controller in it.
    - PBS on separate storage, and the off-site copy.
-3. **The validation run** (§3.2): the configuration matrix, the gate against
-   `LocalRuntime`, fault injection, a PBS restore.
-4. **Octopus file operations and the history store** (`runtime-1.1`),
+4. **The validation run** (§3.2) for the chosen candidate, in full: the
+   configuration matrix, the gate against `LocalRuntime`, fault injection, a
+   restore from backup.
+5. **Octopus file operations and the history store** (`runtime-1.1`),
    implemented in `LocalRuntime` and the agent.
-5. **Admin console.**
-6. **Move the site** into the k3s VM (DB, master key, cloudflared tunnel), with a
+6. **Admin console.**
+7. **Move the site** into the k3s VM (DB, master key, cloudflared tunnel), with a
    rollback path; migrate each account's data onto its VM.
-7. **Full Octopus e2e and the gate of §3.1** with `OCTOPUS_RUNTIME_PROVIDER`
+8. **Full Octopus e2e and the gate of §3.1** with `OCTOPUS_RUNTIME_PROVIDER`
    pointing here. v1 ships on passing it.
 
 ## 16. What v1 defers
@@ -620,8 +723,12 @@ PVE**.
   containers.
 - **KubeVirt** — runs VMs as Kubernetes objects; the alternative kept for
   enterprise Kubernetes platforms.
-- **Kata Containers, gVisor, Firecracker, Cloud Hypervisor** — other isolation
-  options weighed in §2.3.
+- **Kata Containers** — runs each pod in its own small VM with its own guest
+  kernel, under Kubernetes; candidate B (§2.7).
+- **virtio-fs** — a host directory shared into a VM. Convenient, but every
+  metadata operation goes to the host, which makes small-file work slow.
+- **gVisor, Firecracker, Cloud Hypervisor** — other isolation options weighed
+  in §2.3.
 - **Ballooning / free page reporting** — ways a VM hands unused memory back to
   the host, which is what makes memory overcommit possible (deferred, §16).
 - **KSM** — the kernel merging identical memory pages across VMs; saves memory,
